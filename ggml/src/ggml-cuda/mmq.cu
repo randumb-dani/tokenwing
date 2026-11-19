@@ -2,6 +2,7 @@
 #include "mmq.cuh"
 #include "quantize.cuh"
 #include "mmid.cuh"
+#include "moe-fused-prefill.cuh"
 
 #include <cstdint>
 
@@ -202,7 +203,8 @@ void ggml_cuda_mul_mat_q(
 
     // If src0 (or the fused gate weight) is a temporary compute buffer, clear any potential padding.
     for (const ggml_tensor * t : { src0, gate }) {
-        if (t && ggml_backend_buffer_get_usage(t->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE) {
+        if (t && !(t->flags & GGML_TENSOR_FLAG_PREZERO_PAD) &&
+                ggml_backend_buffer_get_usage(t->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE) {
             const size_t size_data  = ggml_nbytes(t);
             const size_t size_alloc = ggml_backend_buffer_get_alloc_size(t->buffer, t);
             if (size_alloc > size_data) {
@@ -241,9 +243,12 @@ void ggml_cuda_mul_mat_q(
             ncols_opt = ne12;
 
             // Each expert only sees ne12*n_expert_used/ne02 tokens on average.
-            // On RDNA3 and RDNA4 it is faster to pick the tile size against this value instead of ne12.
-            if (GGML_CUDA_CC_IS_RDNA3(cc) || GGML_CUDA_CC_IS_RDNA4(cc)) {
-                ncols_opt = (ne12*n_expert_used + ne02 - 1) / ne02;
+            // On RDNA3/RDNA4 (and on Ampere+ CUDA for high-expert-count sparse MoEs when mmq_moe_opt is enabled),
+            // size J against average routed load rather than total batch width.
+            const int64_t avg_tok = (ne12*n_expert_used + ne02 - 1) / ne02;
+            if (GGML_CUDA_CC_IS_RDNA3(cc) || GGML_CUDA_CC_IS_RDNA4(cc) ||
+                    (ggml_cuda_mmq_moe_opt_enabled() && cc >= GGML_CUDA_CC_AMPERE && ne02 >= 128 && avg_tok <= 24)) {
+                ncols_opt = avg_tok;
             }
         }
 

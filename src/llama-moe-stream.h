@@ -199,6 +199,16 @@ struct llama_moe_stream_p1 {
     int32_t     prompt_split_places = 128;   // --moe-stream-prompt-split-places N
     bool        gpu_wave_skip_zero = false;   // --moe-stream-gpu-wave-skip-zero 1
     bool        gpu_skip_zero  = false;   // the GPU one-token mmvq writes 0 for the VRAM pool's zero slices
+    bool        prefill_fast   = false;   // --moe-stream-prefill-fast 1
+    bool        mmq_moe_opt    = false;   // --moe-stream-mmq-moe-opt 1
+    bool        gpu_moe_fused  = false;   // --moe-stream-gpu-moe-fused 1
+    int64_t     pinned_ring    = 0;       // --moe-stream-pinned-ring SIZE
+    bool        lm_bf16        = false;   // --moe-stream-lm-bf16 1
+    bool        lend_output    = false;   // --moe-stream-lend-output 1
+    bool        qsa_fused      = false;   // --moe-stream-qsa-fused 1
+    bool        hc_fused       = false;   // --moe-stream-hc-fused 1
+    bool        ple_fast       = false;   // --moe-stream-ple-fast 1
+    int32_t     hybrid_tail    = 0;       // --moe-stream-hybrid-tail K
     bool        plan           = false;   // --moe-stream-plan 1, the waiting list with late binding (decode words)
     bool        plan_bind_early = false;  // test only - every list entry is bound the moment it is added
     bool        drop_stale     = false;   // at its target's start, entries it did not pick go, and their started reads'
@@ -1616,6 +1626,26 @@ struct llama_moe_stream {
         return g >= 0 && i < tailw_tg.size() ? tailw_tg[i][(size_t) k] : tailw_t[k];
     }
     void tailw_gather(llama_moe_stream_layer & sl, int32_t * out, int64_t n, int32_t wave);   // the remap op, after its slot ids are final
+
+    // Pinned H2D staging ring + routed-only mask + CPU hybrid tail co-execution
+    ggml_backend_buffer_t pring_buf  = nullptr;
+    char *                pring_ptr  = nullptr;
+    size_t                pring_cap  = 0;
+    size_t                pring_head = 0;
+    int64_t               pring_wraps = 0, pring_bytes = 0;
+    void                  pring_ensure();
+    void                  tailw_set_async_staged(ggml_tensor * D, const char * src, size_t dst_off, size_t nbytes);
+
+    std::vector<std::vector<uint8_t>> lm_routed_mask;   // [il][expert]: 1 if routed in lm_phase 1
+    void set_lm_routed_ids(int32_t il, const int32_t * ids_host, int64_t n);
+    void clear_lm_routed_masks() { lm_routed_mask.clear(); }
+
+    struct htail_pair_t { int32_t pair_idx; int32_t slot; };
+    std::vector<htail_pair_t> htail_pairs;
+    int32_t                   htail_il    = -1;
+    bool                      htail_armed = false;
+    int64_t                   htail_computed_pairs = 0, htail_saved_bytes = 0;
+    void compute_hybrid_tail_cpu(const struct ggml_tensor * x_in, const struct ggml_tensor * w_in, struct ggml_tensor * dst, int ith, int nth);
     // Three pieces for --moe-stream-g1-ahead; nothing calls them
     // unless that setting or the test switches below are on
     uint32_t tailw_wave_w = 0;   // (c) the wave width of a tail-wave graph (graph and remap op alike), 0 = the plain width; option A sets the half places

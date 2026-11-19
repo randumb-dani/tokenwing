@@ -4238,6 +4238,13 @@ llama_moe_stream::~llama_moe_stream() {
         if (G.ctx) { ggml_free(G.ctx); }
     }
     vx_groups.clear();
+    if (pring_buf) {
+        ggml_backend_buffer_free(pring_buf);
+        pring_buf  = nullptr;
+        pring_ptr  = nullptr;
+        pring_cap  = 0;
+        pring_head = 0;
+    }
     if (tailw_ctx) {   // the tail waves' tensor headers (their memory is the pool's, freed above)
         ggml_free(tailw_ctx);
         tailw_ctx = nullptr;
@@ -14008,6 +14015,7 @@ void llama_moe_stream_remap(ggml_tensor * dst, const ggml_tensor * a, int ith, i
     mgr->remap(*sl, ids, nullptr, n, n_tok, w->w, out, t0_op);
     mgr->psplit_after_remap(*sl, n_tok, w->w);
     if (dst->flags & LLAMA_MOE_STREAM_TENSOR_TAIL) {
+        mgr->htail_armed = (dst->op_params[2] == 0x48544149);
         mgr->tailw_gather(*sl, out, n, w->w);   // the slot ids become tail places, the copies are queued
     }
 
@@ -14255,6 +14263,7 @@ void llama_moe_stream_remap2(ggml_tensor * dst, const ggml_tensor * a, const ggm
     mgr->remap(*sl, (const int32_t *) a->data, (const int32_t *) b->data, n, n_tok, w->w, (int32_t *) dst->data, t0_op);
     mgr->psplit_after_remap(*sl, n_tok, w->w);
     if (dst->flags & LLAMA_MOE_STREAM_TENSOR_TAIL) {
+        mgr->htail_armed = (dst->op_params[2] == 0x48544149);
         mgr->tailw_gather(*sl, (int32_t *) dst->data, n, w->w);
     }
 
@@ -14306,6 +14315,7 @@ static void llama_moe_stream_remap_b_impl(ggml_tensor * dst, const ggml_tensor *
             t0_op);
     mgr->psplit_after_remap(*sl, n_tok, w->w);
     if (dst->flags & LLAMA_MOE_STREAM_TENSOR_TAIL) {
+        mgr->htail_armed = (dst->op_params[2] == 0x48544149);
         mgr->tailw_gather(*sl, (int32_t *) dst->data, n, w->w);
     }
     llama_moe_stream_remap_after(mgr, sl, w, ids, n, n_tok, t0_op, t_layer0);
@@ -16286,6 +16296,7 @@ bool llama_moe_stream::vx_setup(ggml_backend_dev_t dev, ggml_backend_buffer_type
                 if (ok) {
                     t->buffer = G.buf;
                     t->data   = addr;
+                    t->flags |= GGML_TENSOR_FLAG_PREZERO_PAD;
                     tailw_tg[si][(size_t) k] = t;
                 }
             }
@@ -18075,6 +18086,128 @@ void llama_moe_stream::lm_call_end(bool complete) {
 // stream as runs of consecutive places from consecutive slots, three projections each. From pageable pool memory a host-to-device copy
 // returns once its bytes are staged, so the slots may be refilled when the op returns (the CLOBBER gate's claim); the zero places are
 // copied once after every vacate (they hold experts at word time)
+void llama_moe_stream::pring_ensure() {
+    if (pring_buf != nullptr || p1.pinned_ring <= 0 || tailw_be == nullptr) {
+        return;
+    }
+    ggml_backend_dev_t dev = ggml_backend_get_device(tailw_be);
+    ggml_backend_buffer_type_t hbuft = dev ? ggml_backend_dev_host_buffer_type(dev) : nullptr;
+    if (hbuft == nullptr) {
+        return;
+    }
+    for (int64_t sz = p1.pinned_ring; sz >= ((int64_t) 32 << 20); sz >>= 1) {
+        ggml_backend_buffer_t b = ggml_backend_buft_alloc_buffer(hbuft, (size_t) sz);
+        if (b != nullptr) {
+            pring_buf  = b;
+            pring_ptr  = (char *) ggml_backend_buffer_get_base(b);
+            pring_cap  = (size_t) sz;
+            pring_head = 0;
+            fprintf(stderr, "llama_moe_stream: pinned H2D staging ring allocated: %.1f MiB\n", (double) sz / 1048576.0);
+            break;
+        }
+    }
+}
+
+void llama_moe_stream::tailw_set_async_staged(ggml_tensor * D, const char * src, size_t dst_off, size_t nbytes) {
+    if (pring_ptr == nullptr && p1.pinned_ring > 0) {
+        pring_ensure();
+    }
+    if (pring_ptr == nullptr || nbytes > pring_cap || nbytes == 0) {
+        ggml_backend_tensor_set_async(tailw_be, D, src, dst_off, nbytes);
+        return;
+    }
+    if (pring_head + nbytes > pring_cap) {
+        ggml_backend_synchronize(tailw_be);
+        pring_head = 0;
+        pring_wraps += 1;
+    }
+    char * stage = pring_ptr + pring_head;
+    std::memcpy(stage, src, nbytes);
+    ggml_backend_tensor_set_async(tailw_be, D, stage, dst_off, nbytes);
+    pring_head   = GGML_PAD(pring_head + nbytes, 64);
+    pring_bytes += (int64_t) nbytes;
+}
+
+void llama_moe_stream::set_lm_routed_ids(int32_t il, const int32_t * ids_host, int64_t n) {
+    if (il < 0 || (size_t) il >= layers.size() || !layers[il] || ids_host == nullptr || n <= 0) {
+        return;
+    }
+    if (lm_routed_mask.size() < layers.size()) {
+        lm_routed_mask.resize(layers.size());
+    }
+    const uint32_t ne = layers[il]->n_expert;
+    auto & mask = lm_routed_mask[(size_t) il];
+    mask.assign(ne, 0);
+    for (int64_t i = 0; i < n; ++i) {
+        const int32_t e = ids_host[i];
+        if (e >= 0 && (uint32_t) e < ne) {
+            mask[(size_t) e] = 1;
+        }
+    }
+}
+
+void llama_moe_stream::compute_hybrid_tail_cpu(
+        const ggml_tensor * x_in, const ggml_tensor * w_in, ggml_tensor * dst, int ith, int nth) {
+    const int64_t n_embd = dst->ne[0];
+    const int64_t nt     = dst->ne[1];
+    // Parallel zero-init of dst across threads, then barrier-free accumulation per token or atomic add
+    const int64_t tok0 = (nt * ith) / nth;
+    const int64_t tok1 = (nt * (ith + 1)) / nth;
+    for (int64_t t = tok0; t < tok1; ++t) {
+        std::memset((char *) dst->data + (size_t) t * dst->nb[1], 0, (size_t) n_embd * sizeof(float));
+    }
+    if (htail_pairs.empty() || htail_il < 0 || (size_t) htail_il >= layers.size() || !layers[htail_il]) {
+        return;
+    }
+    const llama_moe_stream_layer & sl = *layers[htail_il];
+    const ggml_tensor * P_gate = sl.weights[0].pool;
+    const ggml_tensor * P_up   = sl.weights[1].pool;
+    const ggml_tensor * P_down = sl.weights[2].pool;
+    const int64_t n_ff         = P_up->ne[1];
+    const int64_t k_used       = w_in->ne[1];
+
+    const auto * tr_gu = ggml_get_type_traits_cpu(P_up->type);
+    const auto * tr_dn = ggml_get_type_traits_cpu(P_down->type);
+    if (!tr_gu || !tr_dn || !tr_gu->from_float || !tr_gu->vec_dot || !tr_dn->from_float || !tr_dn->vec_dot) {
+        return;
+    }
+    std::vector<char>  xq(ggml_row_size(tr_gu->vec_dot_type, n_embd));
+    std::vector<char>  hq(ggml_row_size(tr_dn->vec_dot_type, n_ff));
+    std::vector<float> h_f32((size_t) n_ff);
+
+    for (const auto & hp : htail_pairs) {
+        const int64_t tok = hp.pair_idx / k_used;
+        if (tok < tok0 || tok >= tok1) {
+            continue;
+        }
+        const int64_t kj  = hp.pair_idx % k_used;
+        const float   wt  = *(const float *)((const char *) w_in->data + (size_t) kj * w_in->nb[1] + (size_t) tok * w_in->nb[2]);
+        if (wt == 0.0f) {
+            continue;
+        }
+        const float * x_row = (const float *)((const char *) x_in->data + (size_t) tok * x_in->nb[2]);
+        tr_gu->from_float(x_row, xq.data(), n_embd);
+
+        const char * g_exp = (const char *) P_gate->data + (size_t) hp.slot * P_gate->nb[2];
+        const char * u_exp = (const char *) P_up->data   + (size_t) hp.slot * P_up->nb[2];
+        for (int64_t f = 0; f < n_ff; ++f) {
+            float gv = 0.0f, uv = 0.0f;
+            tr_gu->vec_dot((int) n_embd, &gv, 0, g_exp + (size_t) f * P_gate->nb[1], 0, xq.data(), 0, 1);
+            tr_gu->vec_dot((int) n_embd, &uv, 0, u_exp + (size_t) f * P_up->nb[1],   0, xq.data(), 0, 1);
+            h_f32[(size_t) f] = (gv / (1.0f + std::exp(-gv))) * uv;
+        }
+        tr_dn->from_float(h_f32.data(), hq.data(), n_ff);
+
+        const char * d_exp   = (const char *) P_down->data + (size_t) hp.slot * P_down->nb[2];
+        float *      dst_row = (float *)((char *) dst->data + (size_t) tok * dst->nb[1]);
+        for (int64_t i = 0; i < n_embd; ++i) {
+            float dv = 0.0f;
+            tr_dn->vec_dot((int) n_ff, &dv, 0, d_exp + (size_t) i * P_down->nb[1], 0, hq.data(), 0, 1);
+            dst_row[i] += wt * dv;
+        }
+    }
+}
+
 void llama_moe_stream::tailw_gather(llama_moe_stream_layer & sl, int32_t * out, int64_t n, int32_t wave) {
     if (!tail_vacated) {
         moe_stream_fail("tail waves: layer %d's GPU wave reads the tail's places while experts are held there (the tail was not vacated)", sl.il);
@@ -18241,6 +18374,34 @@ void llama_moe_stream::tailw_gather(llama_moe_stream_layer & sl, int32_t * out, 
         ca_list_e.clear();
         ca_job_il = -1;
     }
+    htail_pairs.clear();
+    htail_il = sl.il;
+    if (htail_armed && p1.hybrid_tail > 0 && (n / (int64_t) n_expert_used) <= 2048 && !ca_test_check) {
+        std::vector<int32_t> slot_uses((size_t) n_pool, 0);
+        for (int64_t i = 0; i < n; i++) {
+            const int32_t s = out[i];
+            if (s >= 0 && s < n_pool && !(s >= zb && s < zb + (int32_t) n_zero)) {
+                slot_uses[(size_t) s] += 1;
+            }
+        }
+        const size_t exp_bytes = sl.weights[0].pool->nb[2] + sl.weights[1].pool->nb[2] + sl.weights[2].pool->nb[2];
+        for (int64_t i = 0; i < n; i++) {
+            const int32_t s = out[i];
+            if (s >= 0 && s < n_pool && slot_uses[(size_t) s] >= 1 && slot_uses[(size_t) s] <= p1.hybrid_tail &&
+                    tailw_place_of[(size_t) s] < 0) {
+                htail_pairs.push_back({ (int32_t) i, s });
+                htail_computed_pairs += 1;
+            }
+        }
+        for (const auto & hp : htail_pairs) {
+            if (tailw_place_of[(size_t) hp.slot] < 0) {
+                tailw_place_of[(size_t) hp.slot] = Wp;   // point GPU at zero place; CPU evaluates these pairs
+                htail_saved_bytes += (int64_t) exp_bytes;
+            }
+        }
+    }
+    htail_armed = false;
+
     int64_t moved = 0;
     for (int pass = 0; pass < 2; pass++) {
         int32_t free_p = 0;
@@ -18322,7 +18483,7 @@ void llama_moe_stream::tailw_gather(llama_moe_stream_layer & sl, int32_t * out, 
             ggml_tensor *       D = g1s[(size_t) k];
             const size_t nb = P->nb[2];
             GGML_ASSERT(nb == D->nb[2] && P->type == D->type);
-            ggml_backend_tensor_set_async(tailw_be, D, (const char *) P->data + (size_t) s0*nb, (size_t) p0*nb, (size_t) len*nb);
+            tailw_set_async_staged(D, (const char *) P->data + (size_t) s0*nb, (size_t) p0*nb, (size_t) len*nb);
             calls += 1;
             bytes += (int64_t) len*(int64_t) nb;
         }
@@ -18335,7 +18496,7 @@ void llama_moe_stream::tailw_gather(llama_moe_stream_layer & sl, int32_t * out, 
         const ggml_tensor * P = sl.weights[2].pool;
         ggml_tensor *       D = g1s[2];
         const size_t nb = P->nb[2];
-        ggml_backend_tensor_set_async(tailw_be, D, (const char *) P->data + (size_t) pd.second*nb, (size_t) pd.first*nb, nb);
+        tailw_set_async_staged(D, (const char *) P->data + (size_t) pd.second*nb, (size_t) pd.first*nb, nb);
         calls += 1;
         bytes += (int64_t) nb;
     }
@@ -18462,8 +18623,10 @@ void llama_moe_stream::tailw_gather(llama_moe_stream_layer & sl, int32_t * out, 
                 }
             }
         } else {
+            const bool has_rmask = p1.pinned_ring > 0 && (size_t) il2 < lm_routed_mask.size() &&
+                                   lm_routed_mask[(size_t) il2].size() == sl2.n_expert;
             for (uint32_t e = 0; e < sl2.n_expert; e++) {
-                if (!sl2.vx_held((int32_t) e)) {
+                if (!sl2.vx_held((int32_t) e) && (!has_rmask || lm_routed_mask[(size_t) il2][e])) {
                     ca_es.push_back((int32_t) e);   // (a held expert may have a RAM copy now; the VRAM pass computes it)
                 }
             }

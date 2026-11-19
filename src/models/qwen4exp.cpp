@@ -523,7 +523,8 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
             ggml_tensor * sh_c  = build_layer_shexp(x_c, il);
             ggml_tensor * out_c = sh_c ? ggml_add(ctx0, moe_c, sh_c) : moe_c;
             ggml_tensor * h_dst = ggml_view_2d(ctx0, params.lm_hid, n_embd * hc, nc, params.lm_hid->nb[1], c0 * params.lm_hid->nb[1]);
-            ggml_tensor * res_c = ggml_reshape_3d(ctx0, h_dst, n_embd, hc, nc);
+            ggml_tensor * h_f32 = h_dst->type == GGML_TYPE_F32 ? h_dst : ggml_cast(ctx0, h_dst, GGML_TYPE_F32);
+            ggml_tensor * res_c = ggml_reshape_3d(ctx0, h_f32, n_embd, hc, nc);
             ggml_tensor * inj_c = ggml_view_2d(ctx0, params.lm_inj, hc, nc, params.lm_inj->nb[1], c0 * params.lm_inj->nb[1]);
             ggml_tensor * comb  = build_hc_combine(res_c, out_c, inj_c, il);
             ggml_build_forward_expand(gf, ggml_cpy(ctx0, ggml_reshape_2d(ctx0, comb, n_embd * hc, nc), h_dst));
@@ -578,6 +579,9 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
     if (params.lm_hid && lm_b > 0) {
         ggml_tensor * hid_in = ggml_view_2d(ctx0, params.lm_hid, n_embd * hc, n_tokens, params.lm_hid->nb[1],
                 params.lm_row0 * params.lm_hid->nb[1]);
+        if (hid_in->type != GGML_TYPE_F32) {
+            hid_in = ggml_cast(ctx0, hid_in, GGML_TYPE_F32);
+        }
         res_hc = ggml_reshape_3d(ctx0, hid_in, n_embd, hc, n_tokens);
     } else {
         GGML_ASSERT(lm_b == 0 && "a layer group after the first reads the call's hidden state (lm_hid)");
@@ -1122,6 +1126,25 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_sel(
 
     // keep the cells of the live picked pools and the tail, -inf elsewhere
     // all retained cells are in the token's sequence, so the kq_mask is not needed
+    const int64_t hd_qsa = hparams.n_embd_head_k();
+    const ggml_type kt_qsa = mctx_hyb->get_attn()->get_k(ctx0, il)->type;
+    const ggml_type vt_qsa = mctx_hyb->get_attn()->get_v(ctx0, il)->type;
+    if (model.prefill_qsa_fused_on() && cparams.flash_attn && !hparams.attn_soft_cap && hparams.f_max_alibi_bias == 0.0f &&
+            (hd_qsa == 64 || hd_qsa == 128 || hd_qsa == 256) && kt_qsa == vt_qsa &&
+            (kt_qsa == GGML_TYPE_F16  || kt_qsa == GGML_TYPE_BF16 ||
+             kt_qsa == GGML_TYPE_Q8_0 || kt_qsa == GGML_TYPE_Q4_0) &&
+            ggml_backend_dev_type(model.dev_layer(il)) != GGML_BACKEND_DEVICE_TYPE_CPU) {
+        ggml_tensor * sel_cells = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, inp_kpool->n_sel, n_tokens);
+        sel_cells->op     = GGML_OP_TOP_K_MASK;
+        sel_cells->src[0] = top_k;
+        sel_cells->src[1] = score;
+        sel_cells->src[2] = inp_kpool->pool_idxs;
+        sel_cells->src[3] = inp_kpool->tail_idxs;
+        sel_cells->op_params[0] = (int32_t) inp_kpool->n_kv;
+        cb(sel_cells, "indexer_sel_cells", il);
+        return sel_cells;
+    }
+
     if (cparams.fused_top_k_mask) {
         GGML_ASSERT(kpool*n_top_pool + inp_kpool->tail_idxs->ne[0] == inp_kpool->n_sel);
 
@@ -1230,10 +1253,12 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
     ggml_tensor * v = mctx_cur->get_v(ctx0, il);
 
     // the selection replaces the kq_mask: split it into the streams of the K view
-    const int64_t n_stream = k->ne[3];
-    GGML_ASSERT(sel->ne[0] == k->ne[2] && sel->ne[1] % n_stream == 0);
-    sel = ggml_reshape_4d(ctx0, sel, sel->ne[0], sel->ne[1]/n_stream, 1, n_stream);
-    cb(sel, "kq_mask_qsa", il);
+    if (sel->type != GGML_TYPE_I32) {
+        const int64_t n_stream = k->ne[3];
+        GGML_ASSERT(sel->ne[0] == k->ne[2] && sel->ne[1] % n_stream == 0);
+        sel = ggml_reshape_4d(ctx0, sel, sel->ne[0], sel->ne[1]/n_stream, 1, n_stream);
+        cb(sel, "kq_mask_qsa", il);
+    }
 
     ggml_tensor * cur = build_attn_mha(q, k, v, nullptr, sel, nullptr, nullptr, n_sel, kq_scale, il);
     cb(cur, "kqv_out", il);
@@ -1570,10 +1595,15 @@ public:
 
     bool can_reuse(const llm_graph_params & params) override {
         mctx = static_cast<const llama_memory_hybrid_idx_context *>(params.mctx)->get_attn();
-        return rows->ne[0] == (int64_t) model.hparams.ple_n_heads * params.ubatch.n_tokens;
+        if (emb_gpu != nullptr) {
+            return emb_gpu->ne[1] == (int64_t) params.ubatch.n_tokens;
+        }
+        return rows && rows->ne[0] == (int64_t) model.hparams.ple_n_heads * params.ubatch.n_tokens;
     }
 
-    ggml_tensor * rows = nullptr;   // I32 [ple_n_heads * n_tokens]
+    ggml_tensor *  rows    = nullptr;   // I32 [ple_n_heads * n_tokens]
+    ggml_tensor *  emb_gpu = nullptr;   // F32 [ple_head_dim * ple_n_heads, n_tokens] when ple_fast GPU gather is active
+    ggml_backend_t gpu_be  = nullptr;
 
     const llama_model & model;
 
@@ -1643,6 +1673,48 @@ void llm_graph_input_qwen4exp_ple::set_input(const llama_ubatch * ubatch) {
                     (int32_t) (mixed % hparams.ple_head_vocab_sizes[h_i] + hparams.ple_head_offsets[h_i]);
             }
         }
+    }
+
+    if (emb_gpu != nullptr && gpu_be != nullptr) {
+        ggml_tensor * ple = model.per_layer_tok_embd;
+        const int     N        = (int) idx.size();
+        const int     head_dim = (int) hparams.ple_head_dim;
+        const size_t  rb       = ple->nb[1];
+
+        std::vector<std::pair<int32_t, int32_t>> order((size_t) N);
+        for (int i = 0; i < N; ++i) {
+            order[(size_t) i] = { idx[(size_t) i], i };
+        }
+        std::sort(order.begin(), order.end());
+
+        std::vector<int32_t> uniq_rows;
+        uniq_rows.reserve((size_t) N);
+        std::vector<int32_t> map_idx((size_t) N);
+        for (int i = 0; i < N; ++i) {
+            if (i == 0 || order[(size_t) i].first != order[(size_t)(i - 1)].first) {
+                uniq_rows.push_back(order[(size_t) i].first);
+            }
+            map_idx[(size_t) order[(size_t) i].second] = (int32_t) uniq_rows.size() - 1;
+        }
+
+        if (model.can_prefetch.count(ple)) {
+            llama_prefetch_rows(ple, uniq_rows.data(), uniq_rows.size());
+        }
+
+        const size_t U = uniq_rows.size();
+        std::vector<char> uniq_raw(U * rb);
+        const char * base = (const char *) ple->data;
+        for (size_t u = 0; u < U; ++u) {
+            std::memcpy(uniq_raw.data() + u * rb, base + (size_t) uniq_rows[u] * rb, rb);
+        }
+
+        ggml_backend_reg_t creg = ggml_backend_reg_by_name("CUDA");
+        if (!creg) { creg = ggml_backend_reg_by_name("ROCm"); }
+        using ple_gather_fn = void (*)(ggml_backend_t, const void *, size_t, ggml_type, const int32_t *, int, int, ggml_tensor *);
+        auto * fn = creg ? (ple_gather_fn) ggml_backend_reg_get_proc_address(creg, "ggml_backend_cuda_ple_gather") : nullptr;
+        GGML_ASSERT(fn != nullptr);
+        fn(gpu_be, uniq_raw.data(), uniq_raw.size(), ple->type, map_idx.data(), N, head_dim, emb_gpu);
+        return;
     }
 
     {
@@ -1724,6 +1796,44 @@ ggml_tensor * llama_model_qwen4exp::graph::build_inp_ple(
 
     // the attention cells see every ubatch regardless of the layer types
     auto ple_inp = std::make_unique<llm_graph_input_qwen4exp_ple>(model, mctx_hyb->get_attn());
+
+    const ggml_type pt = model.per_layer_tok_embd->type;
+    const bool pt_ok   = (pt == GGML_TYPE_IQ4_NL || pt == GGML_TYPE_Q8_0 || pt == GGML_TYPE_Q4_0 ||
+                          pt == GGML_TYPE_F16    || pt == GGML_TYPE_BF16 || pt == GGML_TYPE_F32) &&
+                         (hparams.ple_head_dim % 32 == 0 || pt == GGML_TYPE_F16 || pt == GGML_TYPE_BF16 || pt == GGML_TYPE_F32);
+    ggml_backend_t ple_gpu_be = nullptr;
+    if (model.prefill_ple_fast_on() && pt_ok && sched != nullptr) {
+        int ple_il = 0;
+        for (uint32_t il = 0; il < hparams.n_layer_all; ++il) {
+            if (hparams.is_ple(il)) { ple_il = (int) il; break; }
+        }
+        ggml_backend_dev_t dev = model.dev_layer(ple_il);
+        if (dev && ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU) {
+            ggml_backend_reg_t creg = ggml_backend_reg_by_name("CUDA");
+            if (!creg) { creg = ggml_backend_reg_by_name("ROCm"); }
+            if (creg && ggml_backend_reg_get_proc_address(creg, "ggml_backend_cuda_ple_gather") != nullptr) {
+                const int n_be = ggml_backend_sched_get_n_backends(sched);
+                for (int bi = 0; bi < n_be; ++bi) {
+                    ggml_backend_t be = ggml_backend_sched_get_backend(sched, bi);
+                    if (ggml_backend_get_device(be) == dev) {
+                        ple_gpu_be = be;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    if (ple_gpu_be != nullptr) {
+        ggml_tensor * emb = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hparams.ple_head_dim * n_heads, n_tokens);
+        ggml_set_input(emb);
+        ggml_backend_sched_set_tensor_backend(sched, emb, ple_gpu_be);
+        ple_inp->emb_gpu = emb;
+        ple_inp->gpu_be  = ple_gpu_be;
+        res->add_input(std::move(ple_inp));
+        cb(emb, "ple_embd", -1);
+        return emb;
+    }
 
     ple_inp->rows = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_heads * n_tokens);
     ggml_set_input(ple_inp->rows);
