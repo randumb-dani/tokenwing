@@ -7289,6 +7289,19 @@ bool llama_moe_stream_get_layout(const llama_context * ctx, llama_moe_stream_lay
             }
         }
     }
+    if (mstream->el_on) {
+        const uint32_t mn = mstream->el_min_share_pub.load(std::memory_order_relaxed);
+        const uint32_t eff_mn = mn > 0 ? mn : mstream->n_slots;
+        out->elastic_on             = 1;
+        out->elastic_slots_min      = (int32_t) eff_mn;
+        out->elastic_slots_soft_min = mstream->el_soft_min_layer;
+        out->elastic_given_bytes    = mstream->el_net_given_bytes.load(std::memory_order_relaxed);
+        out->elastic_band_bytes     = mstream->el_dz_now.load(std::memory_order_relaxed) * out->block_bytes;
+        out->elastic_free_bytes     = mstream->el_last_room_bytes.load(std::memory_order_relaxed);
+        out->elastic_state          = (mstream->el_soft_min_layer > 0 && (int32_t) eff_mn < mstream->el_soft_min_layer) ? 2
+                                    : mstream->el_taking ? 3
+                                    : (eff_mn < mstream->n_slots || out->elastic_given_bytes > 0) ? 1 : 0;
+    }
     return true;
 }
 

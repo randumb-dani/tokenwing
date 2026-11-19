@@ -551,9 +551,9 @@ extern "C" {
         // A CPU split's output in the GPU's pinned host buffer goes to the next GPU split with an
         // async H2D on that GPU's stream and no host wait (one GPU, no pipeline parallelism); 0 = off (a synchronous copy)
         int32_t      moe_stream_async_h2d;
-        // Elastic RAM - the pools give RAM back on the kernel's memory-pressure signal and take it back at reply
-        // ends / new requests when RAM is free; 0 = off (fixed pools). ram_margin: bytes to leave free when growing (0 = 500 MiB);
-        // elastic_opts: "step=..,growmin=..,cool=..,stall=..,ceiling=.." (NULL = the defaults)
+        // Elastic RAM - the pools give RAM back on memory pressure / low headroom and take it back smoothly when calm;
+        // 0 = off (fixed pools). ram_margin: bytes to leave free (0 = OS default: 1.25 GiB Linux / 1.5 GiB Win & macOS);
+        // elastic_opts: "keep=..,gap=..,again=..,settle=..,refillstep=..,refillms=..,softmin=..,min=.." (NULL = defaults)
         int32_t      moe_stream_elastic;
         int64_t      moe_stream_ram_margin;
         const char * moe_stream_elastic_opts;
@@ -2222,6 +2222,13 @@ extern "C" {
         int64_t block_bytes;            // bytes of one expert (the first streamed layer's; layers may differ)
         int64_t kv_bytes;               // the KV cache (and the recurrent state) of the context
         int32_t timing;                 // --moe-stream-timing
+        int32_t elastic_on;             // 1 = --moe-stream-elastic active
+        int32_t elastic_state;          // 0 = normal, 1 = shared, 2 = squeezed_warn, 3 = reclaiming
+        int32_t elastic_slots_min;      // smallest current active share per streamed layer
+        int32_t elastic_slots_soft_min; // soft comfort floor per streamed layer (warning threshold)
+        int64_t elastic_given_bytes;    // net bytes currently lent back below initial pool size (0 when >= start)
+        int64_t elastic_band_bytes;     // bytes currently marked OS-discardable in the cold band
+        int64_t elastic_free_bytes;     // last measured free headroom in bytes (-1 = not sampled yet)
     };
 
     // fill out; returns false when streaming is off

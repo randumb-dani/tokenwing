@@ -4261,7 +4261,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         "pools are one window over the layers (the same total): while a layer computes, the next streamed layers' most-used experts "
         "(the usage table) are read into room taken from finished layers, empty slots and - in a full RAM - the layers farthest ahead, "
         "below the running layer's needed reads; a finished layer keeps its share's worth of the call's experts by the prompt-end "
-        "weight, set for the reply. Needs --moe-stream-layer-major 1 and --moe-stream-wave-plan 1; not with --moe-stream-elastic / "
+        "weight, set for the reply. Needs --moe-stream-layer-major 1 and --moe-stream-wave-plan 1; not with "
         "--moe-stream-shares / --moe-stream-hugepages / --moe-stream-pin (default: 0)",
         [](common_params & params, int value) {
             if (value != 0 && value != 1) {   // clamped with a warning
@@ -5043,10 +5043,9 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ));
     add_opt(common_arg(
         {"--moe-stream-elastic"}, "0|1",
-        "1 = elastic RAM: the expert pools give RAM back the moment the kernel's memory-pressure signal (PSI) "
-        "says another program needs it (the least valuable experts are dropped, their pages returned), and take RAM back at a "
-        "reply's end or a new request when at least --moe-stream-elastic-opts growmin is free, down to --moe-stream-ram-margin; "
-        "never above the process's memory cgroup limit; tunables in --moe-stream-elastic-opts (default: 0)",
+        "1 = elastic RAM (Linux, Windows, macOS): routed-expert RAM pools keep the coldest band% discardable for instant zero-write OS reclaim, "
+        "give RAM back immediately when free RAM dips under --moe-stream-ram-margin, and take RAM back in paced steps once free RAM stays "
+        "calm for settle seconds above again; never above the process's cgroup or job memory limit; tunables in --moe-stream-elastic-opts (default: 0)",
         [](common_params & params, int value) {
             if (value != 0 && value != 1) {   // clamped with a warning
                 const int v0 = value;
@@ -5058,16 +5057,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ));
     add_opt(common_arg(
         {"--moe-stream-ram-margin"}, "SIZE",
-        "with --moe-stream-elastic 1: RAM the engine leaves free when it takes RAM back (default: 500MiB)",
+        "with --moe-stream-elastic 1: OS free-RAM floor protected before giving expert slots back (default: 1280MiB Linux, 1536MiB Windows/macOS, 2GiB with no swap/pagefile)",
         [](common_params & params, const std::string & value) {
             params.moe_stream_ram_margin = (int64_t) moe_stream_parse_size(value);
         }
     ));
     add_opt(common_arg(
         {"--moe-stream-elastic-opts"}, "K=V,...",
-        "elastic RAM tunables: step=SIZE given back per pressure event (512MiB), growmin=SIZE free RAM needed before "
-        "taking back (1GiB), cool=SECONDS after a give-back before taking back (60), stall=US of memory stall in 2 s that fires the "
-        "signal (100000), ceiling=N the most slots a layer's pool can ever hold (address space only; default: what all RAM holds)",
+        "elastic RAM tunables: keep=SIZE free-RAM trigger floor, gap=SIZE deadband above keep (512MiB), again=SIZE free RAM needed to start taking back (keep+1GiB), "
+        "settle=SECONDS calm window before taking back (30), refillstep=SIZE max take-back step (256MiB), refillms=MS between take-back steps (5000), "
+        "band=PCT discardable cold band per layer (20), softmin=PCT soft warning floor (25), step=SIZE give-back step (512MiB), lookmin=MS/lookmax=MS (25/250), ceiling=N max slots/layer",
         [](common_params & params, const std::string & value) {
             params.moe_stream_elastic_opts = value;
         }
