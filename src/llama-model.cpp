@@ -1604,6 +1604,10 @@ static llama_moe_stream_srv_terms llama_moe_stream_srv_compute(const llama_hpara
     return t;
 }
 
+// The default --moe-stream-vram-reserve: 2 GiB measured at 4k ctx plus 1.15 GiB the fit used to over-count
+// (kept as one constant so the auto-fit can tell an explicit reserve from this default).
+static const int64_t MOE_STREAM_VRAM_RESERVE_DEFAULT = (int64_t) (3.15 * 1024 * 1024 * 1024);
+
 // One layer's KV cache rows or recurrent state for the context the model is loaded for (llama_model_params' moe_stream_ctx*), at
 // the sizes llama_kv_cache, llama_kv_cache_iswa and llama_memory_recurrent allocate for the plain, SWA and hybrid layouts; the
 // whole-layer VRAM check charges it to the layer's device. A sparse-attention indexer's own cache (qwen4exp) is counted with its layer;
@@ -2192,6 +2196,30 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         // the compute buffers' margin per token of the physical batch (the auto-fit's, and the whole-layer check's estimate)
         static const double fit_mib_per_token = getenv("MOE_STREAM_FIT_MIB_PER_TOKEN")
             ? atof(getenv("MOE_STREAM_FIT_MIB_PER_TOKEN")) : 0.5;
+        // The 2 GiB inside the default --moe-stream-vram-reserve was measured at 4k ctx: the KV cache part
+        // of it does not grow with -c. At a long context the fit then pins whole MoE layers until nothing
+        // is left for the VRAM expert pool, which switches itself off and streams every expert from RAM.
+        // Add the KV bytes the configured context needs above the 4k baseline (issue #25), using the same
+        // per-layer estimate the explicit-list check below uses. MOE_STREAM_FIT_CTX_KV=0 restores the
+        // constant reserve; an explicitly set reserve already accounts for KV and is left alone.
+        static const bool fit_ctx_kv = getenv("MOE_STREAM_FIT_CTX_KV")
+            ? atoi(getenv("MOE_STREAM_FIT_CTX_KV")) != 0 : true;
+        int64_t ctx_kv_delta = 0;
+        if (gpu_layers_n < 0 && !gpu_list && !devices.empty() && fit_ctx_kv &&
+            params.moe_stream_vram_reserve >= MOE_STREAM_VRAM_RESERVE_DEFAULT - (1 << 20) &&
+            params.moe_stream_vram_reserve <= MOE_STREAM_VRAM_RESERVE_DEFAULT + (1 << 20) &&
+            (params.moe_stream_ctx_flags & 4) != 0) {
+            llama_model_params p4 = params;
+            p4.moe_stream_ctx = 4096;
+            for (uint32_t il = 0; il < (uint32_t) n_layer_all; ++il) {
+                if (pimpl->dev_layer[il].dev != devices[0].dev) {
+                    continue;
+                }
+                ctx_kv_delta += llama_moe_stream_layer_ctx_bytes(hparams, arch, il, params)
+                              - llama_moe_stream_layer_ctx_bytes(hparams, arch, il, p4);
+            }
+            ctx_kv_delta = std::max<int64_t>(0, ctx_kv_delta);
+        }
         if (gpu_layers_n < 0 && !gpu_list && !devices.empty()) {
             size_t vram_free = 0;
             size_t vram_total = 0;
@@ -2205,19 +2233,20 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             // MiB per token on top of the user's reserve, 0 restores the constant.
             const int64_t ubatch_margin = (int64_t) (fit_mib_per_token*1024*1024) *
                 (int64_t) (params.moe_stream_ubatch > 0 ? params.moe_stream_ubatch : 512);
-            const int64_t vram_reserve_total = params.moe_stream_vram_reserve + ubatch_margin;
+            const int64_t vram_reserve_total = params.moe_stream_vram_reserve + ubatch_margin + ctx_kv_delta;
 
             vram_reserve = (int64_t) vram_free - gpu_weight_bytes - vram_reserve_total;
 
             fprintf(stderr, "%s: VRAM for whole MoE layers: %.2f GiB free on %s, %.2f GiB of weights go there, "
                     "%.2f GiB reserved for the KV cache, the compute buffers and the driver "
-                    "(%.2f GiB of it %.2f MiB x -ub %d), %.2f GiB left\n",
+                    "(%.2f GiB of it %.2f MiB x -ub %d, %.2f GiB the KV cache above 4k ctx), %.2f GiB left\n",
                     __func__, (double) vram_free/1024.0/1024.0/1024.0,
                     ggml_backend_dev_name(devices[0].dev),
                     (double) gpu_weight_bytes/1024.0/1024.0/1024.0,
                     (double) vram_reserve_total/1024.0/1024.0/1024.0,
                     (double) ubatch_margin/1024.0/1024.0/1024.0, fit_mib_per_token,   // this argument was missing
                     (int) (params.moe_stream_ubatch > 0 ? params.moe_stream_ubatch : 512),
+                    (double) ctx_kv_delta/1024.0/1024.0/1024.0,
                     (double) vram_reserve/1024.0/1024.0/1024.0);
         }
 
@@ -4462,7 +4491,7 @@ llama_model_params llama_model_default_params() {
         /*.moe_stream_io_threads       =*/ 0,
         /*.moe_stream_gpu_waves       =*/ 512,    // the default, 0 = host matmuls for wave graphs
         /*.moe_stream_gpu_layers      =*/ -1,     // the default, negative = fit whole layers to the VRAM
-        /*.moe_stream_vram_reserve    =*/ (int64_t) (3.15 * 1024 * 1024 * 1024),   // 2 GiB, +1.15 GiB since the honest VRAM count
+        /*.moe_stream_vram_reserve    =*/ MOE_STREAM_VRAM_RESERVE_DEFAULT,   // 2 GiB, +1.15 GiB since the honest VRAM count
         /*.moe_stream_gpu_layers_mode =*/ nullptr,
         /*.moe_stream_gpu_layers_list =*/ nullptr,
         /*.moe_stream_ram_free      =*/ 0,
