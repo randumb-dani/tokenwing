@@ -259,6 +259,8 @@ export const GLOB_PATTERNS: string[] = [
 ];
 
 export const SW_CONFIG = {
+	// How long after the page opens a newer page is still taken at once (later it waits for the next opening)
+	APPLY_AT_OPEN_MS: 10000,
 	CHECK_INTERVAL_MS: 60000,
 	UPDATE_FETCH_OPTIONS: {
 		CACHE: 'no-store',
