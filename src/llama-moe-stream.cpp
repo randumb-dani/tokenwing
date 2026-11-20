@@ -1821,7 +1821,7 @@ llama_moe_stream::llama_moe_stream(
     pred_input_every(pred_input_every_in > 0 ? pred_input_every_in : 8),
     vram_reserve  (vram_reserve_in),
     gpu_layers_mode(gpu_layers_mode_in.empty() ? "hot" : gpu_layers_mode_in),
-    ram_free      (ram_free_in == 0 ? (int64_t) MOE_STREAM_DEFAULT_MIN_AVAIL : ram_free_in),
+    ram_free      (ram_free_in == 0 ? llama_moe_stream_start_ram_free(0, 0, 0, 0, "") : ram_free_in),
     other_bytes   (other_bytes_in),
     sidecar   (json_path_in == MOE_STREAM_MODEL_WORD ? model_path : sidecar_data_path(json_path_in)),
     sidecar_json(json_path_in == MOE_STREAM_MODEL_WORD ? model_path : json_path_in),
@@ -10182,8 +10182,8 @@ void llama_moe_stream::end_call(bool complete) {
 
 // ===== Idle-time loading =====
 
-// the constructor's part: on only with the setting, the I/O threads and no elastic RAM / moving shares (they decide the slots' sizes
-// themselves); the table's paths
+// the constructor's part: on only with the setting, the I/O threads and no moving shares (they decide the slots' sizes themselves) or
+// recorder; with elastic RAM the fill at start, idle loading and read-ahead fill only the slots switched on now; the table's paths
 void llama_moe_stream::idle_setup() {
     if (!p1.idle_load && !p1.read_ahead && !win_on) {   // (the window ranks by the usage table too)
         return;
@@ -10191,18 +10191,22 @@ void llama_moe_stream::idle_setup() {
     if (io_threads.empty()) {
         return;   // a plan only: nothing reads
     }
-    if (el_on || sh_on || rec_on() || rec_ev_on) {
+    if (sh_on || rec_on() || rec_ev_on) {
         if (win_on) {   // said, not silent (the window needs the usage table)
             win_on = false;
             fprintf(stderr, "%s: --moe-stream-window is not used with --moe-stream-record (it ranks by the usage table)\n", __func__);
         }
         fprintf(stderr, "%s: --moe-stream-idle-load / --moe-stream-read-ahead are not used with %s\n", __func__, rec_on() || rec_ev_on
                 ? "--moe-stream-record (its events would count idle reads as needed reads)"
-                : "elastic RAM / moving shares (built for fixed pools)");
+                : "moving shares (built for fixed pools)");
         if (p1.fill_start) {
             fprintf(stderr, "%s: --moe-stream-idle-load 2: the RAM pools are not filled at start (the model is ready with empty pools)\n", __func__);
         }
         return;
+    }
+    if (el_on && win_on) {   // the window's pass moves room between layers; it is not built for pools that elastic RAM shrinks and grows
+        win_on = false;
+        fprintf(stderr, "%s: --moe-stream-window is not used with --moe-stream-elastic 1 (its pass is not built for pools that shrink and grow)\n", __func__);
     }
     idle_on       = p1.idle_load;
     ra_on         = p1.read_ahead;
@@ -10316,6 +10320,15 @@ void llama_moe_stream::idle_arm(bool may_fill) {
     if (!us_on) {
         return;
     }
+    // elastic RAM watches free RAM from here on (else from the first call), so a real need during the fill or an idle load is answered;
+    // during the fill it gives back only for a swap-out or free RAM under the headroom (before the lock: its thread takes it)
+    const bool el_fill = el_on && idle_on && p1.fill_start && !fs_done && may_fill;
+    if (el_fill) {
+        el_quiet_until_us.store(INT64_MAX);
+    }
+    if (el_on && idle_on && may_fill && !el_thread.joinable() && el_stop_fd < 0 && el_win_stop_ev == nullptr && el_pipe_fds[0] < 0) {
+        el_start();
+    }
     std::unique_lock<std::mutex> lock(mtx);
     if (!us_loaded) {
         us_load();
@@ -10346,6 +10359,9 @@ void llama_moe_stream::idle_arm(bool may_fill) {
             }
         }
         idle_round(lock, /* start = */ true);
+    }
+    if (el_fill) {
+        el_quiet_until_us.store(ggml_time_us() + MOE_STREAM_EL_FILL_SETTLE_US);
     }
     if (!idle_thread.joinable()) {
         idle_thread = std::thread([this] { idle_loop(); });
@@ -10503,6 +10519,8 @@ void llama_moe_stream::idle_round(std::unique_lock<std::mutex> & lock, bool star
     const size_t  max_out = start ? 2*std::max<size_t>(1, io_threads.size()) : std::max<size_t>(2, io_threads.size());
     const auto    outstanding = [&] { return (size_t) n_idle_loading; };
     const int64_t seq0 = idle_call_seq;
+    // (elastic RAM: a give-back switches the empty slots off first and never a slot being read, and the scan below skips switched-off
+    // slots, so a round goes on through give-backs and simply finds fewer slots)
     const auto    stop = [&] { return idle_quit || idle_calls > 0 || idle_call_seq != seq0; };   // any call since the start
     int64_t n_issued = 0;
     bool    any      = true;
@@ -10543,8 +10561,8 @@ void llama_moe_stream::idle_round(std::unique_lock<std::mutex> & lock, bool star
     for (size_t r = 0; any && !stop(); r++) {
         any = false;
         for (lyr & x : ls) {
-            if (r >= x.rank.size() || x.scan >= x.sl->n_slots) {
-                continue;
+            if (r >= x.rank.size() || x.scan >= x.sl->n_slots || x.n_iss >= x.n_empty) {
+                continue;   // (n_empty: slots elastic RAM switches on meanwhile wait for its own refill or the next round)
             }
             any = true;
             wait_below(max_out);
@@ -20921,8 +20939,10 @@ bool llama_moe_stream_cap_now(int64_t * use, int64_t * file_cache) {
     return true;
 }
 
+// One RAM headroom in both modes: --moe-stream-ram-free when given; else --moe-stream-ram-margin / keep=, else the OS default (2 GiB
+// with no swap). Elastic RAM with no pinned slots starts a little under it (half the gap, at most 256 MiB) and fills up to it
 int64_t llama_moe_stream_start_ram_free(int32_t elastic, int32_t slots, int64_t ram_free, int64_t ram_margin, const char * elastic_opts) {
-    if (elastic != 1 || slots > 0 || ram_free != 0) {
+    if (ram_free != 0) {
         return ram_free;
     }
     int64_t keep = ram_margin > 0 ? ram_margin : el_os_default_keep_bytes();
@@ -20940,8 +20960,11 @@ int64_t llama_moe_stream_start_ram_free(int32_t elastic, int32_t slots, int64_t 
     if (!keep_set && el_read_swap_kind(sdesc) == 0) {
         keep = std::max<int64_t>(keep, (int64_t) 2 << 30);   // no swap / pagefile: 2 GiB
     }
+    if (elastic != 1 || slots > 0) {
+        return keep > 0 ? keep : el_os_default_keep_bytes();
+    }
     const int64_t start_free = keep + std::min<int64_t>(gap / 2, (int64_t) 256 << 20);
-    return start_free > 0 ? start_free : ram_free;
+    return start_free > 0 ? start_free : el_os_default_keep_bytes();
 }
 
 void llama_moe_stream::el_parse_opts() {
@@ -21004,15 +21027,13 @@ void llama_moe_stream::el_parse_opts() {
     if (el_drop == 0) {
         el_drop = el_step/2;   // by default free RAM may fall at most half a give-back step between two looks
     }
-    if (!p1.ram_margin_set) {
+    if (!p1.ram_margin_set) {   // the same default as llama_moe_stream_start_ram_free, with or without elastic RAM
         p1.ram_margin = el_os_default_keep_bytes();
-        if (el_on) {
-            std::string sdesc;
-            if (el_read_swap_kind(sdesc) == 0) {
-                p1.ram_margin = std::max<int64_t>(p1.ram_margin, (int64_t) 2 << 30);   // 2 GiB
-                fprintf(stderr, "%s: elastic RAM: no swap on this machine (%s): keep-free %.1f GiB by default (keep= or --moe-stream-ram-margin sets it)\n",
-                        __func__, sdesc.c_str(), p1.ram_margin / 1073741824.0);
-            }
+        std::string sdesc;
+        if (el_read_swap_kind(sdesc) == 0) {
+            p1.ram_margin = std::max<int64_t>(p1.ram_margin, (int64_t) 2 << 30);   // 2 GiB
+            fprintf(stderr, "%s: no swap on this machine (%s): RAM kept free %.1f GiB by default (--moe-stream-ram-free sets it)\n",
+                    __func__, sdesc.c_str(), p1.ram_margin / 1073741824.0);
         }
     }
     // A tunable out of its range goes back to its default - one line names them
@@ -22439,6 +22460,7 @@ void llama_moe_stream::el_at_call_start(bool decode, int32_t n_tok) {
     if (el_on && !el_thread.joinable() && el_stop_fd < 0 && el_win_stop_ev == nullptr && el_pipe_fds[0] < 0) {
         el_start();
     }
+    el_quiet_until_us.store(0);   // a request: the load is over, the settle after the fill at start ends here
     const el_mem mem = el_on && !decode ? el_read_mem() : el_mem{};   // read before the lock (el_take waits for a filling step)
     std::unique_lock<std::mutex> lock(mtx);
     el_in_call = true;
@@ -23110,6 +23132,9 @@ void llama_moe_stream::el_ask(int64_t bytes) {
     if (!q_refill.empty()) {
         el_refill_drain(nullptr, 0, INT32_MAX);   // RAM is short: the take-back's queued refill reads stop (their slots EMPTY, given first)
     }
+    if (!q_idle.empty()) {
+        idle_drain();   // the same for the queued idle loads (the fill at start's too)
+    }
     const int64_t pend = el_req.load();
     const int64_t add  = el_test_pending_ignore ? bytes : std::max<int64_t>(0, bytes - pend);   // TEST ONLY: the failure test adds it all
     el_n_ask_cut += bytes - add;
@@ -23236,7 +23261,7 @@ int64_t llama_moe_stream::el_tr_decide(int64_t now, int64_t x, int64_t memfree, 
     // RAM, a PSI need). It holds the growth part only: what keep-free lacks is trimmed at once (in smoke runs, at the floor,
     // free RAM stayed under keep-free for minutes)
     const int64_t last_ev = std::max(el_last_big_give_us, el_last_obj_us);
-    const bool settling = last_ev > 0 && (now - last_ev)/1e6 < el_cool_s;
+    const bool settling = (last_ev > 0 && (now - last_ev)/1e6 < el_cool_s) || now < el_quiet_until_us.load();   // (the fill at start too)
     const int64_t blk = (int64_t) layers[il_of_moe[0]]->block_bytes;
     int64_t growth = 0;   // what the engine could still take: each layer up to the take-back's own ceiling (el_ceil - with slot shares a share
     for (const int32_t il : il_of_moe) {   // of the current total; counting the pool's top instead could disagree)
@@ -23710,6 +23735,7 @@ void llama_moe_stream::el_loop() {
             const int64_t own   = el_os_own();
             const int64_t others = el_os_others();
             const int64_t now   = ggml_time_us();
+            const bool    quiet = now < el_quiet_until_us.load();   // the fill at start: no give-back or trim from the rate (below)
             double rate = 0.0;
             const int64_t meas = others >= 0 ? others + el_tr_got : (avail >= 0 ? -avail : -1);
             if (meas != -1) {
@@ -23808,7 +23834,7 @@ void llama_moe_stream::el_loop() {
             // to the band's middle as it will be then
             const bool fast = rate >= (double) el_fast_rate;   // a fall below fastrate is noise, not a need
             const int64_t fall = dist == INT64_MAX ? 0 : (int64_t) (el_pace*rate*wait/1000.0);
-            if (paced && fast && !under && dist != INT64_MAX && fall > dist && above && !el_test_give_ignore) {
+            if (paced && fast && !quiet && !under && dist != INT64_MAX && fall > dist && above && !el_test_give_ignore) {
                 const int64_t g = mid - (x - fall);
                 if (g > give) {   // (a) foreseen: back to keep-free + the gap as free RAM will be by the next look
                     give   = g;
@@ -23837,7 +23863,7 @@ void llama_moe_stream::el_loop() {
             // The pacing check: with the pacing's own measure (a safety factor of el_pace, else 2), a look that foresees free RAM under
             // keep-free before the next look must have looked sooner or given back (the failure test PACE_OFF must stop here)
             const double pc = el_pace > 0 ? el_pace : 2.0;
-            if (el_check && el_pace > 0 && fast && !under && above && give == 0 && dist != INT64_MAX && pc*rate*wait/1000.0 > (double) dist) {
+            if (el_check && el_pace > 0 && fast && !quiet && !under && above && give == 0 && dist != INT64_MAX && pc*rate*wait/1000.0 > (double) dist) {
                 moe_stream_fail("elastic check (pacing): the other programs take %.0f MiB/s and free RAM %.0f MiB is %.0f MiB above "
                         "keep-free %.0f MiB: at %.1f x that rate it crosses before the next look in %d ms, and no give-back was asked",
                         rate/1048576.0, x/1048576.0, dist/1048576.0, keep/1048576.0, pc, wait);
@@ -23895,11 +23921,12 @@ void llama_moe_stream::el_loop() {
         std::unique_lock<std::mutex> plock(mtx);
         const int64_t x_ev = room >= 0 ? room - el_x_committed() : -1;
         plock.unlock();
-        const bool short_ram = room >= 0 && x_ev < el_psi_floor;
+        const bool quiet_ev  = ggml_time_us() < el_quiet_until_us.load();   // the fill at start: a need only under the headroom
+        const bool short_ram = room >= 0 && x_ev < (quiet_ev ? p1.ram_margin : el_psi_floor);
         fprintf(stderr, "llama_moe_stream: elastic RAM pressure event at %.3f s (%s%s%s), free room %.0f MiB (avail %.0f MiB): %s\n",
                 ggml_time_us()/1e6, ev_sys ? "system" : "", ev_sys && ev_cg ? " + " : "", ev_cg ? "this process's cgroup" : "",
                 x_ev/1048576.0, el_os_avail()/1048576.0, short_ram ? "a need - give back" :
-                "ignored (more than psifloor free)");
+                quiet_ev ? "ignored (loading: more than keep-free free)" : "ignored (more than psifloor free)");
         if (!short_ram) {
             el_n_ignored += 1;
             continue;
