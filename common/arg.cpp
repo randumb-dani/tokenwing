@@ -907,6 +907,10 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
     const auto off = [](const char * x, const char * why) {
         LOG_WRN("%s is off: it needs %s\n", x, why);
     };
+    // The unified tier is a whole-VRAM hot pool: no whole-layer partition, whatever order the args came in.
+    if (params.moe_stream_unified_tier == 1) {
+        params.moe_stream_gpu_layers = 0;
+    }
     if (params.moe_stream_plan == 1) {
         // the waiting list replaces these guess paths: the list stays, the older setting goes (MOE_STREAM_TEST_ORACLE_LIST=1,
         // test only, lets the oracle feed the list)
@@ -4542,6 +4546,24 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
                 LOG_WRN("--moe-stream-vram-copyback must be 0 or 1: %d -> %d\n", v0, value);
             }
             params.moe_stream_vram_copyback = value;
+        }
+    ));
+    add_opt(common_arg(
+        {"--moe-stream-unified-tier"}, "0|1",
+        "1 = one hotness ranking for both memory tiers: the decayed use count that picks RAM eviction victims also ranks "
+        "VRAM-follow swaps, and no whole MoE layers are kept in VRAM (-gpu-layers 0 is forced), so all of VRAM is the hot "
+        "expert pool. Needs a GPU expert pool (--moe-stream-vram-free SIZE or --moe-stream-vram-experts N). Falls back with "
+        "one line to the plain path when no pool fits (default: 0 = off)",
+        [](common_params & params, int value) {
+            if (value != 0 && value != 1) {   // clamped with a warning
+                const int v0 = value;
+                value = std::min(std::max(value, 0), 1);
+                LOG_WRN("--moe-stream-unified-tier must be 0 or 1: %d -> %d\n", v0, value);
+            }
+            params.moe_stream_unified_tier = value;
+            if (value == 1) {
+                params.moe_stream_gpu_layers = 0;   // all VRAM goes to the hot pool, no whole-layer partition
+            }
         }
     ));
     add_opt(common_arg(
